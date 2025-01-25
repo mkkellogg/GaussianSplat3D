@@ -829,6 +829,111 @@ export class Viewer {
     }
 
     /**
+     * Add a splat scene to the viewer from a file and display any loading UI if appropriate.
+     * @param {File} file File containing the splats
+     * @param {object} options {
+     *         splatAlphaRemovalThreshold: Ignore any splats with an alpha less than the specified
+     *                                     value (valid range: 0 - 255), defaults to 1
+     *
+     *         showLoadingUI:         Display a loading spinner while the scene is loading, defaults to true
+     *
+     *         position (Array<number>):   Position of the scene, acts as an offset from its default position, defaults to [0, 0, 0]
+     *
+     *         rotation (Array<number>):   Rotation of the scene represented as a quaternion, defaults to [0, 0, 0, 1]
+     *
+     *         scale (Array<number>):      Scene's scale, defaults to [1, 1, 1]
+     *
+     *         onProgress:                 Function to be called as file data are received, or other processing occurs
+     *
+     * }
+     * @return {AbortablePromise}
+     **/
+
+    addSplatSceneFromFile(file, options = {}) {
+        if (this.isLoadingOrUnloading()) {
+            throw new Error('Cannot add splat scene while another load or unload is already in progress.');
+        }
+
+        if (this.isDisposingOrDisposed()) {
+            throw new Error('Cannot add splat scene after dispose() is called.');
+        }
+
+        if (options.progressiveLoad && this.splatMesh.scenes && this.splatMesh.scenes.length > 0) {
+            console.log('addSplatScene(): "progressiveLoad" option ignore because there are multiple splat scenes');
+            options.progressiveLoad = false;
+        }
+
+
+        // TODO: check if the file is a File
+
+        const format = (options.format !== undefined && options.format !== null) ? options.format : sceneFormatFromPath(path);
+        const progressiveLoad = Viewer.isProgressivelyLoadable(format) && options.progressiveLoad;
+        const showLoadingUI = (options.showLoadingUI !== undefined && options.showLoadingUI !== null) ? options.showLoadingUI : true;
+
+        let loadingUITaskId = null;
+        if (showLoadingUI) {
+            this.loadingSpinner.removeAllTasks();
+            loadingUITaskId = this.loadingSpinner.addTask(`Loading ${file.fileName} ...`);
+        }
+        const hideLoadingUI = () => {
+            this.loadingProgressBar.hide();
+            this.loadingSpinner.removeAllTasks();
+        };
+
+        const onProgressUIUpdate = (percentComplete, percentCompleteLabel, loaderStatus) => {
+            if (showLoadingUI && loaderStatus === LoaderStatus.Processing) {
+                this.loadingSpinner.setMessageForTask(loadingUITaskId, `Processing splats : ${percentCompleteLabel}`);
+            }
+        };
+
+        let downloadDone = false;
+        let downloadedPercentage = 0;
+        const splatBuffersAddedUIUpdate = (firstBuild, finalBuild) => {
+            if (showLoadingUI) {
+                if (firstBuild && progressiveLoad || finalBuild && !progressiveLoad) {
+                    this.loadingSpinner.removeTask(loadingUITaskId);
+                    if (!finalBuild && !downloadDone) this.loadingProgressBar.show();
+                }
+                if (progressiveLoad) {
+                    if (finalBuild) {
+                        downloadDone = true;
+                        this.loadingProgressBar.hide();
+                    } else {
+                        this.loadingProgressBar.setProgress(downloadedPercentage);
+                    }
+                }
+            }
+        };
+
+        const onProgress = (percentComplete, percentCompleteLabel, loaderStatus) => {
+            downloadedPercentage = percentComplete;
+            onProgressUIUpdate(percentComplete, percentCompleteLabel, loaderStatus);
+            if (options.onProgress) options.onProgress(percentComplete, percentCompleteLabel, loaderStatus);
+        };
+
+        const buildSection = (splatBuffer, firstBuild, finalBuild) => {
+            if (!progressiveLoad && options.onProgress) options.onProgress(0, '0%', LoaderStatus.Processing);
+            const addSplatBufferOptions = {
+                'rotation': options.rotation || options.orientation,
+                'position': options.position,
+                'scale': options.scale,
+                'splatAlphaRemovalThreshold': options.splatAlphaRemovalThreshold,
+            };
+            return this.addSplatBuffers([splatBuffer], [addSplatBufferOptions],
+                finalBuild, firstBuild && showLoadingUI, showLoadingUI,
+                progressiveLoad, progressiveLoad).then(() => {
+                if (!progressiveLoad && options.onProgress) options.onProgress(100, '100%', LoaderStatus.Processing);
+                splatBuffersAddedUIUpdate(firstBuild, finalBuild);
+            });
+
+        };
+
+        // const loadFunc = progressiveLoad ? this.downloadAndBuildSingleSplatSceneProgressiveLoad.bind(this) :
+        const loadFunc = this.buildSingleSplatSceneFromFile.bind(this)
+        return loadFunc(file, format, options.splatAlphaRemovalThreshold, buildSection.bind(this), onProgress, hideLoadingUI.bind(this));
+    }
+
+    /**
      * Download a single splat scene, convert to splat buffer and then rebuild the viewer's splat mesh
      * by calling 'buildFunc' -- all before displaying the scene. Also sets/clears relevant instance synchronization objects,
      * and calls appropriate functions on success or failure.
@@ -865,6 +970,53 @@ export class Viewer {
         this.setSplatSceneDownloadAndBuildPromise(downloadAndBuildPromise.promise);
 
         return downloadAndBuildPromise.promise;
+    }
+
+    /**
+     * Load a single splat scene from a file, convert to splat buffer and then rebuild the viewer's splat mesh
+     * by calling 'buildFunc' -- all before displaying the scene. Also sets/clears relevant instance synchronization objects,
+     * and calls appropriate functions on success or failure.
+     * @param {File} file File containing the splats
+     * @param {SceneFormat} format Format of the splat scene file
+     * @param {number} splatAlphaRemovalThreshold Ignore any splats with an alpha less than the specified value (valid range: 0 - 255)
+     * @param {function} buildFunc Function to build the viewer's splat mesh with the downloaded splat buffer
+     * @param {function} onProgress Function to be called as file data are received, or other processing occurs
+     * @param {function} onException Function to be called when exception occurs
+     * @return {AbortablePromise}
+     */
+    buildSingleSplatSceneFromFile(file, format, splatAlphaRemovalThreshold, buildFunc, onProgress, onException) {
+        // Build a promise that read the file data, and call onException on error
+        const loadFileDataPromise = new Promise((resolve, _reject) => {
+            const reader = new FileReader();
+            reader.onload = (_loadEvent) => {
+                if (reader.readyState == FileReader.DONE) {
+                    resolve(reader.result);
+                }
+            }
+            reader.onerror = onException; // reject is not use, the exception are direclty handle by the onExpection callback
+            reader.readAsArrayBuffer(file);
+        })
+
+        const loadAndBuildPromise = loadFileDataPromise
+            .then((fileData) => {
+                // Read the data from the file
+                let buildScenePromise = this.loadSplatSceneFromFileToSplatBuffer(fileData, splatAlphaRemovalThreshold, onProgress, false, undefined, format);
+                return buildScenePromise;
+            })
+            .then((splatBuffer) => {
+                // Construct a scene from the splatBuffer
+                this.removeSplatSceneDownloadPromise(loadFileDataPromise);
+                return buildFunc(splatBuffer, true, true).then(() => {
+                    this.clearSplatSceneDownloadAndBuildPromise();
+                });
+            })
+            .catch((e) => {
+                if (onException) onException();
+                this.clearSplatSceneDownloadAndBuildPromise();
+                const error = (e instanceof AbortedPromiseError) ? e : new Error(`Viewer::addSplatScene -> Could not load file ${file.fileName}`);
+            });
+
+        return loadAndBuildPromise;
     }
 
     /**
@@ -1083,6 +1235,31 @@ export class Viewer {
         throw new Error(`Viewer::downloadSplatSceneToSplatBuffer -> File format not supported: ${path}`);
     }
 
+    /**
+     * Load a splat scene from an ArrayBuffer and convert to SplatBuffer instance.
+     * @param {ArrayBuffer} fileData The data of the file
+     * @param {number} splatAlphaRemovalThreshold Ignore any splats with an alpha less than the specified
+     *                                            value (valid range: 0 - 255), defaults to 1
+     *
+     * @param {function} onProgress Function to be called as file data are received
+     * @param {boolean} progressiveBuild Construct file sections into splat buffers as they are downloaded
+     * @param {function} onSectionBuilt Function to be called when new section is added to the file
+     * @param {string} format File format of the scene
+     * @return {AbortablePromise}
+     */
+    loadSplatSceneFromFileToSplatBuffer(fileData, splatAlphaRemovalThreshold = 1, onProgress = undefined,
+        progressiveBuild = false, onSectionBuilt = undefined, format) {
+        if (format === SceneFormat.Splat) {
+            return SplatLoader.loadFromFileData(fileData, splatAlphaRemovalThreshold, 0, false);
+        } else if (format === SceneFormat.KSplat) {
+            return KSplatLoader.loadFromFileData(fileData);
+        } else if (format === SceneFormat.Ply) {
+            return PlyLoader.loadFromFileData(fileData, splatAlphaRemovalThreshold, this.plyInMemoryCompressionLevel, this.sphericalHarmonicsDegree);
+        }
+
+        throw new Error(`Viewer::LoadSplatSceneFromFileToSplatBuffer -> File format not supported: ${path}`);
+    }
+
     static isProgressivelyLoadable(format) {
         return format === SceneFormat.Splat || format === SceneFormat.KSplat || format === SceneFormat.Ply;
     }
@@ -1274,8 +1451,8 @@ export class Viewer {
                         this.sortWorkerPrecomputedDistances = new DistancesArrayType(e.data.precomputedDistancesBuffer,
                                                                                      e.data.precomputedDistancesOffset,
                                                                                      maxSplatCount);
-                         this.sortWorkerTransforms = new Float32Array(e.data.transformsBuffer,
-                                                                      e.data.transformsOffset, Constants.MaxScenes * 16);
+                        this.sortWorkerTransforms = new Float32Array(e.data.transformsBuffer,
+                                                                     e.data.transformsOffset, Constants.MaxScenes * 16);
                     } else {
                         this.sortWorkerIndexesToSort = new Uint32Array(maxSplatCount);
                         this.sortWorkerPrecomputedDistances = new DistancesArrayType(maxSplatCount);
